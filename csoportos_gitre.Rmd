@@ -1,0 +1,1287 @@
+---
+title: "good"
+author: "Tosoki Samu"
+date: "2025-10-28"
+output: html_document
+---
+
+also dont forget to report the use of chatgpt (relied heavily on it with the geocodes and stuff)
+
+Samu's working directory
+```{r}
+rm(list = ls())
+setwd("~/Library/Mobile Documents/com~apple~CloudDocs/Downloads/korvó/mester/econometrics")
+```
+
+
+packages
+```{r}
+library(tidyverse)
+library(readxl)
+library(dplyr)
+library(stringr)
+library(tidygeocoder)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(httr)
+library(jsonlite)
+library(readr)
+library(geosphere)
+```
+
+data (and its preparation)
+```{r}
+prices <- read_xlsx("2024.10.01-10.07.xlsx")
+attach(prices)
+str(prices)
+Company <- as.factor(Company)
+Date <- as.Date(Date)
+prices$id <- paste(Settlement, Company, Address, sep = " | ")
+```
+
+creating variables from the original dataset
+```{r}
+#creating the weekly avg price per station variable
+weekly <- prices %>%
+  group_by(id, Settlement, Company, Address) %>%
+  summarise(
+    gasoline_avg = mean(`Gasoline (HUF/l)`, na.rm = TRUE),
+    diesel_avg   = mean(`Diesel (HUF/l)`,   na.rm = TRUE),
+    n_days       = n_distinct(Date),
+    .groups = "drop")
+
+#category of stations based on Company
+levels(Company)
+premium <- c("Mol","Shell","Omv","Orlen")
+discount <- c("Auchan","Avia","Oil!","Mobil Petrol","Mol Partner+") #this categorization is subjective, might be possible to improve
+
+weekly <- weekly %>%
+  mutate(
+    brand_cat = case_when(
+      Company %in% premium  ~ "premium",
+      Company %in% discount ~ "discount",
+      TRUE                  ~ "small"))
+
+#competion variable: number of stations in the same settlement
+sett_counts <- weekly %>% count(Settlement, name = "n_sett_stations")
+
+#alternative competition variable: number of stations from different brands in the same settlement
+competitors <- weekly %>%
+  count(Settlement, Company, name = "brand_in_sett") %>%
+  right_join(weekly, by = c("Settlement","Company")) %>%
+  group_by(Settlement) %>%
+  mutate(total_sett = n()) %>%
+  ungroup() %>%
+  mutate(n_n_competitors_other_brand = total_sett - brand_in_sett)
+weekly <- competitors
+
+
+#brand HHI variable: measures market concentration
+brand_counts <- weekly %>% 
+  count(Settlement, Company, name = "n") %>%
+  left_join(sett_counts, by = "Settlement") %>%
+  mutate(share = n / n_sett_stations)
+
+hhi <- brand_counts %>%
+  group_by(Settlement) %>%
+  summarise(hhi_brand = sum((share*100)^2)/10000, .groups = "drop")
+
+#brand category shares in each settlement
+cat_counts <- weekly %>% 
+  count(Settlement, brand_cat, name = "n") %>%
+  tidyr::pivot_wider(names_from = brand_cat, values_from = n, values_fill = 0) %>%
+  left_join(sett_counts, by = "Settlement") %>%
+  mutate(
+    share_small    = ifelse(is.na(small), 0, small) / n_sett_stations,
+    share_premium  = ifelse(is.na(premium), 0, premium) / n_sett_stations,
+    share_discount = ifelse(is.na(discount), 0, discount) / n_sett_stations
+  ) %>%
+  select(Settlement, share_small, share_premium, share_discount)
+```
+
+
+
+
+creating further variables from KSH and other data
+
+nearest competitor distance variable: very hard to create valid geocodied data from the address column
+border_5/10_km dummy: done                         
+on_highway: done                          
+dist_border: done                   
+income: only from t-star (not accessible)
+pop_density: done
+```{r}
+#population density variable
+dgh <- read_excel("dgh_download_2025.xlsx", skip = 2) %>%
+  select(Settlement = `Locality name`,
+         area_ha    = `Area (hectare)`,
+         population = `Resident population`) %>%
+  mutate(
+    Settlement = str_squish(as.character(Settlement)),
+    pop_density = population / (area_ha / 100)) #this gives people per km2
+```
+
+
+on highway variable
+```{r}
+weekly <- weekly %>%
+  mutate(
+    on_highway =
+      str_detect(
+        Address,
+        regex("M[0-9]{1,2}|aut.o?pa?lya|pihen.o|km[- ]?szelv", ignore_case = TRUE)
+      ) %>%
+      as.integer()
+  )
+table(weekly$on_highway, useNA="ifany") #81 stations are on highways; usually they occur in pairs (one on each side) so having uneven number of stations seems strange but not impossible
+```
+
+get the settlement coordinates
+```{r}
+sett <- weekly %>%
+  distinct(Settlement) %>%
+  mutate(Settlement = str_squish(as.character(Settlement)))
+if (!file.exists("sett_coords_old.csv")) { #it is important to have the sett_coords.csv data in the proper directory, otherwise this code takes 5+ minutes to run
+  set.seed(1)
+  sett_coords <- sett %>%
+    mutate(query = paste(Settlement, "Hungary")) %>%
+    geocode(address = query, method = "osm",
+            lat = lat, long = lon, limit = 1, min_time = 0.15)
+  write.csv(sett_coords, "sett_coords_old.csv", row.names = FALSE) 
+} else {
+  sett_coords <- read.csv("sett_coords_old.csv", stringsAsFactors = FALSE)
+}
+```
+
+
+EZ FASZA
+```{r}
+# ===================== HU–SZOMSZÉD HATÁR + TÁVOLSÁGOK (EGYBEN) =====================
+
+
+sf::sf_use_s2(TRUE)  # geodéziai predikátumok és távolságok
+
+#--- Bemenet ellenőrzése -----------------------------------------------------
+stopifnot(exists("weekly"), "Settlement" %in% names(weekly))
+
+#--- Település-centroidok beolvasása -----------------------------------------
+sett_coords <- read_csv("sett_coords.csv", show_col_types = FALSE) %>%
+  transmute(
+    Settlement = str_squish(as.character(Settlement)),
+    lat = as.numeric(lat),
+    lon = as.numeric(lon)
+  ) %>%
+  filter(!is.na(lat), !is.na(lon), Settlement != "") %>%
+  distinct(Settlement, .keep_all = TRUE)
+stopifnot(nrow(sett_coords) > 0)
+
+sett_sf <- st_as_sf(sett_coords, coords = c("lon","lat"), crs = 4326, remove = FALSE)
+
+#--- Magyarország határa: a kért definíció -----------------------------------
+hungary <- ne_countries(scale = "medium", country = "Hungary", returnclass = "sf") |>
+  st_make_valid() |> st_transform(4326)
+
+#--- Szomszédos országok ugyanebben a CRS-ben --------------------------------
+neighbors <- c("Austria","Slovakia","Slovenia","Croatia","Romania","Serbia","Ukraine")
+nb <- ne_countries(scale = "medium", country = neighbors, returnclass = "sf") |>
+  st_make_valid() |> st_transform(4326)
+
+#--- Közös HU–szomszéd határvonal (csak GEOMETRIAK – nincs attribútum-konfliktus) ---
+hu_edge   <- st_boundary(st_geometry(hungary))     # sfc LINESTRING
+nb_edge   <- st_boundary(st_geometry(nb))          # sfc (több LINESTRING)
+nb_union  <- st_union(nb_edge)                      # sfc (egyesített szomszéd-határ)
+
+border_raw <- suppressWarnings(st_intersection(hu_edge, nb_union))  # sfc
+border_sfc <- st_collection_extract(border_raw, "LINESTRING", warn = FALSE)
+border_lines <- st_as_sf(data.frame(geometry = border_sfc), crs = 4326)
+stopifnot(nrow(border_lines) > 0)
+
+#--- Szomszéd ország hozzárendelése a határszegmensekhez ----------------------
+# Reprezentatív pont a szegmens közepén → legközelebbi szomszéd poligon
+midpts <- st_centroid(border_lines$geometry)
+
+midpts <- st_cast(midpts, "POINT", warn = FALSE)
+if (length(midpts) != nrow(border_lines)) {
+  # fallback: centroid, ha egy/két elem üres lenne
+  midpts <- st_centroid(border_lines$geometry)
+}
+midpts_sf <- st_as_sf(data.frame(geometry = midpts), crs = 4326)
+
+nearest_idx <- st_nearest_feature(midpts_sf, nb)
+border_lines$neighbor <- nb$name_long[nearest_idx]
+
+# Schengen státusz (HU szomszédok közül ezek Schengenben)
+schengen_set <- c("Austria","Slovakia","Slovenia","Croatia")
+border_lines$is_schengen <- border_lines$neighbor %in% schengen_set
+
+#--- Település → legközelebbi határszakasz geodéziai táv (m) -----------------
+D <- st_distance(sett_sf, border_lines)  # units mátrix (m)
+min_idx <- apply(D, 1, which.min)
+min_m   <- apply(D, 1, min)
+
+#--- Eredmények település szinten --------------------------------------------
+sett_out <- sett_coords %>%
+  mutate(
+    dist_border_km          = as.numeric(min_m) / 1000,
+    nearest_country_border  = border_lines$neighbor[min_idx],
+    nearest_border_schengen = as.integer(border_lines$is_schengen[min_idx]),
+    near_border_10km        = as.integer(dist_border_km <= 10),
+    near_border_20km        = as.integer(dist_border_km <= 20)
+  )
+
+#--- Join vissza a weekly-hez -------------------------------------------------
+weekly <- weekly %>%
+  mutate(Settlement = str_squish(as.character(Settlement))) %>%
+  left_join(sett_out, by = "Settlement")
+
+#--- Gyors ellenőrzések ------------------------------------------------------
+stopifnot(all(is.finite(weekly$dist_border_km)), all(weekly$dist_border_km >= 0))
+print(summary(weekly$dist_border_km))
+print(table(Schengen = weekly$nearest_border_schengen, useNA = "ifany"))
+print(table(`≤20km_határtól` = weekly$near_border_20km, useNA = "ifany"))
+
+#--- (Opcionális) Térkép ellenőrzéshez ---------------------------------------
+ggplot() +
+  geom_sf(data = hungary, fill = NA, linewidth = 0.4) +
+  geom_sf(data = border_lines, aes(linetype = is_schengen), linewidth = 0.6, alpha = 0.7) +
+  geom_point(
+    data = sett_out,
+    aes(x = lon, y = lat, color = near_border_20km == 1),
+    size = 1.9, alpha = 0.9
+  ) +
+  scale_color_manual(values = c("FALSE" = "#2C7FB8", "TRUE" = "#D7301F"),
+                     labels = c("FALSE"="> 20 km", "TRUE"="≤ 20 km"),
+                     name = "Határtól") +
+  scale_linetype_manual(values = c("TRUE"="solid","FALSE"="dashed"),
+                        labels = c("TRUE"="Schengen", "FALSE"="Nem Schengen"),
+                        name = "Szomszéd") +
+  coord_sf(xlim = st_bbox(hungary)[c("xmin","xmax")],
+           ylim = st_bbox(hungary)[c("ymin","ymax")], expand = FALSE) +
+  labs(title = "Települések távolsága a tényleges államhatártól (HU–szomszéd)") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank(), legend.position = "right")
+# ============================================================================
+
+```
+
+tehát akkor most van az adatbázison belül machinált voltzok
+aztan legközelebbi határ és hogy schengen e ez inetrakcióval jó lesz a mdoellbe
+legközelebbi versenytárs? - ez nem fog összejönni, mert macerás address alapján geokódolni. de a lognumber of comeptitiors in the settlement is jü közelítés, plusz hhi index
+
+final dataset
+```{r}
+data <- weekly %>%
+  left_join(sett_counts,   by = "Settlement") %>%
+  left_join(hhi,           by = "Settlement") %>%
+  left_join(cat_counts,    by = "Settlement") %>%
+  left_join(sett_out,      by = "Settlement") %>%      # << határátkelő
+  left_join(dgh,           by = "Settlement") %>%      # << pop density
+  mutate(
+    brand_cat = factor(brand_cat, levels = c("small","discount","premium")),
+    brand_cat_discount = as.integer(brand_cat == "discount"),
+    brand_cat_premium  = as.integer(brand_cat == "premium"),
+    log_n_sett = log(n_sett_stations),
+    log_n_n_competitors_other_brand = log(n_n_competitors_other_brand + 0.00001)
+  )
+
+names(data)
+
+
+data_clean <- data %>%
+  select(-ends_with(".y")) %>%
+  rename_with(~sub("\\.x$", "", .), ends_with(".x"))
+
+
+# quick check
+str(data_clean)
+write.csv(data_clean, "modelling_data.csv", row.names = FALSE)
+```
+
+creating regression models
+```{r}
+library(tidyverse)
+library(lmtest)
+library(estimatr)
+library(car)
+rm(list = ls())
+data <- read.csv("modelling_data.csv")
+
+data <- data %>% mutate(across(c('Settlement',
+                                 "Company",
+                                 "brand_cat",
+                                 "on_highway",
+                               #  "nearest_country_border", these two were not created properly, do not use them
+                              #   "nearest_border_schengen",
+                                 "near_border_10km",
+                                 "near_border_20km",
+                                 ), as.factor))
+
+
+
+#data<-data %>% filter(Company!="Volánbusz Zrt.")
+
+#volanbuszt kiszurni, mert ott csak buszokat tankolnak dizellel, átlagnál alacsonyabb áron - nem modositott igazabol
+```
+
+```{r}
+
+set.seed(123)
+
+train_index <- sample(seq_len(nrow(data)), size = 0.8 * nrow(data))
+
+train_data <- data[train_index, ]
+test_data  <- data[-train_index, ]
+```
+
+
+# I. Gasoline
+### Effect of brand premium
+```{r}
+train_data$brand_cat<-relevel(train_data$brand_cat, "premium")
+
+model1<-lm(gasoline_avg~
+             brand_cat, train_data)
+
+bptest(model1) 
+resettest(model1) #It’s testing something trivial: whether a polynomial transformation of a single variable adds explanatory power
+```
+
+### Controlled for by local market structure
+```{r}
+model2<-lm(gasoline_avg~
+             brand_cat+
+             brand_in_sett+
+             n_competitors_other_brand+
+             hhi_brand, train_data)
+
+vif(model2) #tolerable multicollinearity
+bptest(model2) #the residuals are heteroskedastic
+resettest(model2) #incorrectly specified
+waldtest(model1, model2) #local market structure increases model fit signficantly
+
+```
+Smaller and discount brands both operate with lower prices on average
+An increase of stations of one brand increases its local monopoly effect as well as their brand effect. Their dense local presence might signal reliability or service quality, allowing higher prices.
+An increase of competitive stations causes an effect the other way around
+
+### Controlled for by local market structure and population density
+```{r}
+
+model3<-lm(gasoline_avg~
+             brand_cat+
+             brand_in_sett+
+             n_competitors_other_brand+
+             hhi_brand+
+             pop_density, train_data)
+
+vif(model3) #tolerable multicollinearity
+bptest(model3) #the residuals are heteroskedastic
+resettest(model3) #incorrectly specified
+waldtest(model2, model3) #anova logic breaks bc pop.density has lower sample size
+```
+Higher throughput (more customers per station) may allow operators to maintain margins with lower prices.
+Higher density - cities, where public transport is more widely available - may have lower demand for gasoline, leading to lower prices.
+
+### Taking log for better fit
+```{r}
+model4<-lm(gasoline_avg~
+             brand_cat+
+             log(brand_in_sett+0.000001)+
+             log(n_competitors_other_brand+0.0000001)+
+             hhi_brand+
+             log(pop_density), train_data)
+
+vif(model4) #tolerable multicollinearity
+bptest(model4) #the residuals are heteroskedastic
+resettest(model4) #incorrectly specified
+anova(model3, model4) #anova logic breaks bc pop.density has lower sample size
+```
+Highway stations primarily serve transient drivers — travelers with limited choice of alternatives. They can’t easily shop around or detour into nearby towns for cheaper fuel.
+By far the most economically significant effect
+
+```{r}
+stargazer::stargazer(model1, model2, model3, model4,
+          se = list(
+            sqrt(diag(vcovHC(model1, type = "HC1"))),
+            sqrt(diag(vcovHC(model2, type = "HC1"))),
+            sqrt(diag(vcovHC(model3, type = "HC1"))),
+            sqrt(diag(vcovHC(model4, type = "HC1")))
+          ),
+          column.labels = c("M1", "M2", "M3", "M4"),
+          type = "text",
+          digits = 3,
+          title = "Regression results with robust (HC1) standard errors")
+```
+
+## Continuing with Model  -now for location specific effects (did not run specifications after each model in this case, summary table includes them)
+
+```{r}
+
+model5<-lm(gasoline_avg~
+             brand_cat+
+             log(brand_in_sett+0.000001)+
+             log(n_competitors_other_brand+0.0000001)+
+             hhi_brand+
+             log(pop_density)+
+             on_highway, train_data)
+waldtest(model4, model5)
+```
+
+```{r}
+model6<-lm(gasoline_avg~
+             brand_cat+
+             log(brand_in_sett+0.000001)+
+             log(n_competitors_other_brand+0.0000001)+
+             hhi_brand+
+             log(pop_density)+
+             on_highway+
+             dist_border_km, train_data)
+
+waldtest(model5, model6) #will not include border distance in km
+```
+
+```{r}
+model7<-lm(gasoline_avg~
+             brand_cat+
+             log(brand_in_sett+0.000001)+
+             log(n_competitors_other_brand+0.0000001)+
+             hhi_brand+
+             log(pop_density)+
+             on_highway+
+             near_border_10km, train_data)
+
+waldtest(model5, model7) #will not include 10km dummy
+```
+
+```{r}
+model8<-lm(gasoline_avg~
+             brand_cat+
+             log(brand_in_sett+0.000001)+
+             log(n_competitors_other_brand+0.0000001)+
+             hhi_brand+
+             log(pop_density)+
+             on_highway+
+             near_border_20km, train_data)
+
+waldtest(model5, model8) #will not include 20km dummy (on its own)
+```
+
+```{r}
+stargazer::stargazer(model5, model6, model7, model8,
+          se = list(
+            sqrt(diag(vcovHC(model1, type = "HC1"))),
+            sqrt(diag(vcovHC(model2, type = "HC1"))),
+            sqrt(diag(vcovHC(model3, type = "HC1"))),
+            sqrt(diag(vcovHC(model4, type = "HC1")))
+          ),
+          column.labels = c("M5", "M6", "M7", "M8"),
+          type = "text",  
+          digits = 3,
+          title = "Regression results with robust (HC1) standard errors")
+```
+
+## Interaction terms
+
+```{r}
+
+## highway stations may be forced to reduce prices near border crossings as travelers have to option to refuel across the border instead
+
+model9<-lm(gasoline_avg~
+             brand_cat+
+             log(brand_in_sett+0.000001)+
+             log(n_competitors_other_brand+0.0000001)+
+             hhi_brand+
+             log(pop_density)+
+             on_highway+
+             near_border_10km*on_highway,
+            train_data)
+
+model10<-lm(gasoline_avg~
+             brand_cat+
+             log(brand_in_sett+0.000001)+
+             log(n_competitors_other_brand+0.0000001)+
+             hhi_brand+
+             log(pop_density)+
+             on_highway+
+             near_border_20km*on_highway,
+            train_data)
+
+waldtest(model5, model9)
+waldtest(model5, model10) #interaction term between 20km and highway dummy is worth including in the model
+
+table(train_data$near_border_20km, train_data$on_highway) #there are only a limited amount of observations but 20km from the border and on a highway - footnote
+
+#Interpetation
+#Stations located on highways charge substantially more for gasoline, but this premium is significantly smaller if they are close to a border crossing. Border proximity reduces the monopoly power of highway stations, likely because consumers can refuel across the border or because competition near borders is more intense.
+
+#competitor positive coefficient: ahol megeri versenyezni ott fizetokepesebb valszeg a kereslet
+```
+### Final model (M10)
+```{r}
+vif(model10, type="predicto") 
+
+```
+Tolerable multicollinearity
+
+```{r}
+bptest(model10) #heteroskedastic
+library(sandwich)
+
+
+stargazer::stargazer(model10, model10,
+          se = list(NULL, sqrt(diag(vcovHC(model10, type = "HC1")))),
+          column.labels = c("M10", "M10_robust"),
+          type = "text",
+          header = FALSE,
+          digits = 3)
+```
+Heteroskedastic-robust standard errors 
+
+Residual plot
+```{r}
+
+par(mfrow = c(1, 2))
+
+plot(fitted(model1), resid(model1),
+     main = "M1: Residuals vs Fitted",
+     xlab = "Fitted Values",
+     ylab = "Residuals",
+     pch = 19, col = "gray40")
+abline(h = 0, col = "red", lty = 2)
+
+plot(fitted(model10), resid(model10),
+     main = "M10: Residuals vs Fitted",
+     xlab = "Fitted Values",
+     ylab = "Residuals",
+     pch = 19, col = "gray40")
+abline(h = 0, col = "red", lty = 2)
+
+par(mfrow = c(1, 1))
+
+```
+QQplots
+```{r}
+par(mfrow = c(1,2))
+qqnorm(residuals(model1), main = "M1 Residuals")
+qqline(residuals(model1), col = "red")
+qqnorm(residuals(model10), main = "M10 Residuals (Final)")
+qqline(residuals(model10), col = "red")
+par(mfrow = c(1,1))
+```
+
+
+## Model comparison summary for gasoline
+```{r}
+library(lmtest)
+library(tibble)
+library(kableExtra)
+
+model_comparison <- tibble(
+  Model = paste0("M_gasoline", 1:10),
+  AIC = c(
+    AIC(model1), AIC(model2), AIC(model3), AIC(model4),
+    AIC(model5), AIC(model6), AIC(model7), AIC(model8),
+    AIC(model9), AIC(model10)
+  ),
+  BIC = c(
+    BIC(model1), BIC(model2), BIC(model3), BIC(model4),
+    BIC(model5), BIC(model6), BIC(model7), BIC(model8),
+    BIC(model9), BIC(model10)
+  ),
+  Testing_RMSE = c(
+    sqrt(mean((test_data$gasoline_avg - predict(model1, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model2, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model3, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model4, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model5, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model6, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model7, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model8, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model9, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model10, newdata = test_data))^2, na.rm = TRUE))
+  ),
+  BP_p = c(
+    bptest(model1)$p.value,
+    bptest(model2)$p.value,
+    bptest(model3)$p.value,
+    bptest(model4)$p.value,
+    bptest(model5)$p.value,
+    bptest(model6)$p.value,
+    bptest(model7)$p.value,
+    bptest(model8)$p.value,
+    bptest(model9)$p.value,
+    bptest(model10)$p.value
+  ),
+  RESET_p = c(
+    resettest(model1, power = 2:3, type = "fitted")$p.value,
+    resettest(model2, power = 2:3, type = "fitted")$p.value,
+    resettest(model3, power = 2:3, type = "fitted")$p.value,
+    resettest(model4, power = 2:3, type = "fitted")$p.value,
+    resettest(model5, power = 2:3, type = "fitted")$p.value,
+    resettest(model6, power = 2:3, type = "fitted")$p.value,
+    resettest(model7, power = 2:3, type = "fitted")$p.value,
+    resettest(model8, power = 2:3, type = "fitted")$p.value,
+    resettest(model9, power = 2:3, type = "fitted")$p.value,
+    resettest(model10, power = 2:3, type = "fitted")$p.value
+  )
+)
+
+
+model_comparison %>%
+  mutate(
+    across(c(AIC, BIC, Testing_RMSE, BP_p, RESET_p), ~round(.x, 3))
+  ) %>%
+  kable(
+    caption = "Model comparison (M1–M10) including AIC, BIC, out-of-sample RMSE, and diagnostic test results",
+    digits = 3
+  ) %>%
+  kable_styling(full_width = FALSE)
+
+```
+
+```{r}
+
+car::vif(gasoline) #tolerable multicollinearity
+lmtest::bptest(gasoline) #model is heteroskedastic
+
+model_data <- data.frame(
+  residuals = gasoline$residuals,
+  fitted_values = gasoline$fitted.values
+)
+
+residual_plot <- ggplot(model_data, aes(x = fitted_values, y = residuals)) +
+  geom_point(alpha = 0.8, color = "black") +
+  geom_hline(yintercept=0, linetype="dashed")+
+  #geom_smooth(method = "loess", se = FALSE, color = "firebrick", linewidth = 1) +
+  labs(
+    title = "Residuals against Fitted Values of the Gasoline model",
+    x = "Fitted Values",
+    y = "Residuals"
+  ) +
+  theme_minimal(base_size = 12)
+residual_plot
+```
+
+
+# II. Diesel
+```{r}
+model_diesel1<-lm(diesel_avg~
+             brand_cat, train_data)
+
+bptest(model_diesel1) 
+resettest(model_diesel1) #It’s testing something trivial: whether a polynomial transformation of a single variable adds explanatory power
+```
+
+### Controlled for by local market structure
+```{r}
+model_diesel2<-lm(diesel_avg~
+             brand_cat+
+             brand_in_sett+
+             n_competitors_other_brand+
+             hhi_brand, train_data)
+
+vif(model_diesel2) #tolerable multicollinearity
+bptest(model_diesel2) #the residuals are heteroskedastic
+resettest(model_diesel2) #incorrectly specified
+waldtest(model_diesel1, model_diesel2) #local market structure increases model_diesel fit signficantly
+
+```
+Smaller and discount brands both operate with lower prices on average
+An increase of stations of one brand increases its local monopoly effect as well as their brand effect. Their dense local presence might signal reliability or service quality, allowing higher prices.
+An increase of competitive stations causes an effect the other way around
+
+### Controlled for by local market structure and population density
+```{r}
+
+model_diesel3<-lm(diesel_avg~
+             brand_cat+
+             brand_in_sett+
+             n_competitors_other_brand+
+             hhi_brand+
+             pop_density, train_data)
+
+vif(model_diesel3) #tolerable multicollinearity
+bptest(model_diesel3) #the residuals are heteroskedastic
+resettest(model_diesel3) #incorrectly specified
+waldtest(model_diesel2, model_diesel3) #anova logic breaks bc pop.density has lower sample size
+```
+Higher throughput (more customers per station) may allow operators to maintain margins with lower prices.
+Higher density - cities, where public transport is more widely available - may have lower demand for diesel, leading to lower prices.
+
+### Taking log for better fit
+```{r}
+model_diesel4<-lm(diesel_avg~
+             brand_cat+
+             log(brand_in_sett+0.000001)+
+             log(n_competitors_other_brand+0.0000001)+
+             hhi_brand+
+             log(pop_density), train_data)
+
+vif(model_diesel4) #tolerable multicollinearity
+bptest(model_diesel4) #the residuals are heteroskedastic
+resettest(model_diesel4) #incorrectly specified
+anova(model_diesel3, model_diesel4) #anova logic breaks 
+```
+Highway stations primarily serve transient drivers — travelers with limited choice of alternatives. They can’t easily shop around or detour into nearby towns for cheaper fuel.
+By far the most economically significant effect
+
+```{r}
+stargazer::stargazer(model_diesel1, model_diesel2, model_diesel3, model_diesel4,
+          se = list(
+            sqrt(diag(vcovHC(model_diesel1, type = "HC1"))),
+            sqrt(diag(vcovHC(model_diesel2, type = "HC1"))),
+            sqrt(diag(vcovHC(model_diesel3, type = "HC1"))),
+            sqrt(diag(vcovHC(model_diesel4, type = "HC1")))
+          ),
+          column.labels = c("M1", "M2", "M3", "M4"),
+          type = "text",
+          digits = 3,
+          title = "Regression results with robust (HC1) standard errors")
+```
+
+## Continuing with model_diesel  -now for location specific effects (did not run specifications after each model_diesel in this case, summary table includes them)
+
+```{r}
+
+model_diesel5<-lm(diesel_avg~
+             brand_cat+
+             log(brand_in_sett+0.000001)+
+             log(n_competitors_other_brand+0.0000001)+
+             hhi_brand+
+             log(pop_density)+
+             on_highway, train_data)
+waldtest(model_diesel4, model_diesel5) #highway worth including
+```
+
+```{r}
+model_diesel6<-lm(diesel_avg~
+             brand_cat+
+             log(brand_in_sett+0.000001)+
+             log(n_competitors_other_brand+0.0000001)+
+             hhi_brand+
+             log(pop_density)+
+             on_highway+
+             dist_border_km, train_data)
+
+waldtest(model_diesel5, model_diesel6) #will not include border distance in km
+```
+
+```{r}
+model_diesel7<-lm(diesel_avg~
+             brand_cat+
+             log(brand_in_sett+0.000001)+
+             log(n_competitors_other_brand+0.0000001)+
+             hhi_brand+
+             log(pop_density)+
+             on_highway+
+             near_border_10km, train_data)
+
+waldtest(model_diesel5, model_diesel7) #will not include 10km dummy
+```
+
+```{r}
+model_diesel8<-lm(diesel_avg~
+             brand_cat+
+             log(brand_in_sett+0.000001)+
+             log(n_competitors_other_brand+0.0000001)+
+             hhi_brand+
+             log(pop_density)+
+             on_highway+
+             near_border_20km, train_data)
+
+waldtest(model_diesel5, model_diesel8) #will not include 20km dummy (on its own)
+```
+
+```{r}
+stargazer::stargazer(model_diesel5, model_diesel6, model_diesel7, model_diesel8,
+          se = list(
+            sqrt(diag(vcovHC(model_diesel1, type = "HC1"))),
+            sqrt(diag(vcovHC(model_diesel2, type = "HC1"))),
+            sqrt(diag(vcovHC(model_diesel3, type = "HC1"))),
+            sqrt(diag(vcovHC(model_diesel4, type = "HC1")))
+          ),
+          column.labels = c("M5", "M6", "M7", "M8"),
+          type = "text",  
+          digits = 3,
+          title = "Regression results with robust (HC1) standard errors")
+```
+
+## Interaction terms
+
+```{r}
+
+## highway stations may be forced to reduce prices near border crossings as travelers have to option to refuel across the border instead
+
+model_diesel9<-lm(diesel_avg~
+             brand_cat+
+             log(brand_in_sett+0.000001)+
+             log(n_competitors_other_brand+0.0000001)+
+             hhi_brand+
+             log(pop_density)+
+             on_highway+
+             near_border_10km*on_highway,
+            train_data)
+
+model_diesel10<-lm(diesel_avg~
+             brand_cat+
+             log(brand_in_sett+0.000001)+
+             log(n_competitors_other_brand+0.0000001)+
+             hhi_brand+
+             log(pop_density)+
+             on_highway+
+             near_border_20km*on_highway,
+            train_data)
+
+waldtest(model_diesel5, model_diesel9)
+waldtest(model_diesel5, model_diesel10) #interaction term between 20km and highway dummy is worth including in the model_diesel
+
+#there are only a limited amount of observations but 20km from the border and on a highway - footnote
+
+#Interpetation
+#Stations located on highways charge substantially more for diesel, but this premium is significantly smaller if they are close to a border crossing. Border proximity reduces the monopoly power of highway stations, likely because consumers can refuel across the border or because competition near borders is more intense.
+
+#competitor positive coefficient: ahol megeri versenyezni ott fizetokepesebb valszeg a kereslet
+```
+### Final model (M10)
+```{r}
+vif(model_diesel10) 
+```
+Tolerable multicollinearity
+
+```{r}
+bptest(model_diesel10) #heteroskedastic
+library(sandwich)
+
+
+stargazer::stargazer(model_diesel10, model_diesel10,
+          se = list(NULL, sqrt(diag(vcovHC(model_diesel10, type = "HC1")))),
+          column.labels = c("OLS (regular SEs)", "OLS (robust SEs)"),
+          type = "text",
+          header = FALSE,
+          digits = 3)
+```
+Heteroskedastic-robust standard errors 
+
+Residual plot
+```{r}
+
+par(mfrow = c(1, 2))
+
+plot(fitted(model_diesel1), resid(model_diesel1),
+     main = "M1: Residuals vs Fitted",
+     xlab = "Fitted Values",
+     ylab = "Residuals",
+     pch = 19, col = "gray40")
+abline(h = 0, col = "red", lty = 2)
+
+plot(fitted(model_diesel10), resid(model_diesel10),
+     main = "M10: Residuals vs Fitted",
+     xlab = "Fitted Values",
+     ylab = "Residuals",
+     pch = 19, col = "gray40")
+abline(h = 0, col = "red", lty = 2)
+
+par(mfrow = c(1, 1))
+
+```
+QQplots
+```{r}
+par(mfrow = c(1,2))
+qqnorm(residuals(model_diesel1), main = "M1_dieseel Residuals")
+qqline(residuals(model_diesel1), col = "red")
+qqnorm(residuals(model_diesel10), main = "M10_diesel Residuals (Final)")
+qqline(residuals(model_diesel10), col = "red")
+par(mfrow = c(1,1))
+```
+
+
+## model_diesel comparison summary for
+```{r}
+library(lmtest)
+library(tibble)
+library(kableExtra)
+
+model_diesel_comparison <- tibble(
+  model_diesel = paste0("M_diesel", 1:10),
+  AIC = c(
+    AIC(model_diesel1), AIC(model_diesel2), AIC(model_diesel3), AIC(model_diesel4),
+    AIC(model_diesel5), AIC(model_diesel6), AIC(model_diesel7), AIC(model_diesel8),
+    AIC(model_diesel9), AIC(model_diesel10)
+  ),
+  BIC = c(
+    BIC(model_diesel1), BIC(model_diesel2), BIC(model_diesel3), BIC(model_diesel4),
+    BIC(model_diesel5), BIC(model_diesel6), BIC(model_diesel7), BIC(model_diesel8),
+    BIC(model_diesel9), BIC(model_diesel10)
+  ),
+  Testing_RMSE = c(
+    sqrt(mean((test_data$gasoline_avg - predict(model_diesel1, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model_diesel2, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model_diesel3, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model_diesel4, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model_diesel5, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model_diesel6, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model_diesel7, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model_diesel8, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model_diesel9, newdata = test_data))^2, na.rm = TRUE)),
+    sqrt(mean((test_data$gasoline_avg - predict(model_diesel10, newdata = test_data))^2, na.rm = TRUE))
+  ),
+  BP_p = c(
+    bptest(model_diesel1)$p.value,
+    bptest(model_diesel2)$p.value,
+    bptest(model_diesel3)$p.value,
+    bptest(model_diesel4)$p.value,
+    bptest(model_diesel5)$p.value,
+    bptest(model_diesel6)$p.value,
+    bptest(model_diesel7)$p.value,
+    bptest(model_diesel8)$p.value,
+    bptest(model_diesel9)$p.value,
+    bptest(model_diesel10)$p.value
+  ),
+  RESET_p = c(
+    resettest(model_diesel1, power = 2:3, type = "fitted")$p.value,
+    resettest(model_diesel2, power = 2:3, type = "fitted")$p.value,
+    resettest(model_diesel3, power = 2:3, type = "fitted")$p.value,
+    resettest(model_diesel4, power = 2:3, type = "fitted")$p.value,
+    resettest(model_diesel5, power = 2:3, type = "fitted")$p.value,
+    resettest(model_diesel6, power = 2:3, type = "fitted")$p.value,
+    resettest(model_diesel7, power = 2:3, type = "fitted")$p.value,
+    resettest(model_diesel8, power = 2:3, type = "fitted")$p.value,
+    resettest(model_diesel9, power = 2:3, type = "fitted")$p.value,
+    resettest(model_diesel10, power = 2:3, type = "fitted")$p.value
+  )
+)
+
+
+model_diesel_comparison %>%
+  mutate(
+    across(c(AIC, BIC, Testing_RMSE, BP_p, RESET_p), ~round(.x, 3))
+  ) %>%
+  kable(
+    caption = "Model comparison for diesel (M1–M10) including AIC, BIC, out-of-sample RMSE, and diagnostic test results",
+    digits = 3
+  ) %>%
+  kable_styling(full_width = FALSE)
+
+```
+
+Final models with robust standard errors
+```{r}
+stargazer::stargazer(model10, model_diesel10,
+          se = list(
+            sqrt(diag(vcovHC(model10, type = "HC1"))),
+            sqrt(diag(vcovHC(model_diesel10, type = "HC1")))
+          ),
+          type = "text",  
+          digits = 3,
+          title = "Regression results with robust (HC1) standard errors")
+
+stargazer::stargazer(model10, model_diesel10, type="text")
+```
+
+# Plots
+```{r}
+
+library(sf)
+library(ggplot2)
+library(rnaturalearth)
+
+stations_sf <- st_as_sf(data, coords = c("lon", "lat"), crs = 4326)
+
+hungary <- ne_countries(scale = "medium", country = "Hungary", returnclass = "sf")
+
+highways <- opq("Hungary") %>% add_osm_feature(key = "highway", value = c("motorway", "motorway_link")) %>% osmdata_sf()
+
+highway_sf <- highways$osm_lines  # road geometries
+```
+
+Spatial Distribution of Fuel Stations by Brand Category
+```{r}
+brand_cat_map <- ggplot() +
+  geom_sf(data = hungary, fill = "white", color = "black") +
+  geom_sf(data = highway_sf, size = 0.5, alpha = 0.8) +
+  geom_sf(data = stations_sf, aes(color = brand_cat), size = 1.8) +
+  scale_color_manual(
+    values = c("premium"  = "grey40",
+               "discount" = "#FDB462",
+               "small"    = "#BEBADA"),
+    labels = c("premium"  = "Premium",
+               "discount" = "Discount",
+               "small"    = "Small")
+  ) +
+  theme_void() +
+  labs(
+    title = "Brand Categories of Fuel Stations in Hungary",
+    subtitle = "Highway network (motorways only) displayed in background",
+    color = "Brand tier"
+  )
+brand_cat_map
+```
+
+Boxplots of Gasoline Price by Brand Category
+```{r}
+brand_cat_boxplot<-ggplot(data, aes(x = brand_cat, y = gasoline_avg, fill = brand_cat)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 21) +
+  scale_fill_brewer(palette = "PuOr",
+                    name="Brand category",
+                    labels = c(
+    "small"    = "Small",
+    "discount" = "Discount",
+    "premium"  = "Premium")) +
+  scale_x_discrete(
+    labels = c(
+    "small"    = "n = 186",
+    "discount" = "n = 142",
+    "premium"  = "n = 887")) +
+  labs(
+    x = "Brand Category",
+    y = "Gasoline Price (HUF/liter, weekly average)") +
+  theme_minimal(base_size = 12)
+
+brand_cat_boxplot
+```
+
+Spatial Distribution of Fuel Stations by Highway Location
+```{r}
+
+on_highway_map <- ggplot() +
+  geom_sf(data = hungary, fill = "white", color = "black") +
+  geom_sf(data = highway_sf, size = 0.5, alpha = 0.8) +
+  geom_sf(
+    data = stations_sf,
+    aes(color = factor(on_highway, levels = c(1, 0))),
+    size = 1.8, alpha = 0.8
+  ) +
+  scale_color_manual(
+    values = c("1" = "#FDB462",
+               "0" = "grey40"),
+    labels = c("1" = "On highway", "0" = "Off highway")
+  ) +
+  theme_void() +
+  labs(
+    title = "Spatial Distribution of Fuel Stations by Highway Location",
+    subtitle = "Highway network (motorways only) shown in the background",
+    color = "Station location"
+  )
+on_highway_map
+```
+Boxplots of Gasoline Price by Highway Location
+```{r}
+on_highway_boxplot <- ggplot(data, aes(x = factor(on_highway), y = gasoline_avg, fill = factor(on_highway))) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 21) +
+  scale_fill_manual(
+    name = "Station location",
+    labels = c("0" = "Off highway", "1" = "On highway"),
+    values = c("1" = "#FDB462", "0" = "grey40")
+  ) +
+  
+  scale_x_discrete(
+    labels = c("0" = "Off highway (n=1134)", "1" = "On highway (n=81)")
+  ) +
+  
+  labs(
+    x = "Station location",
+    y = "Gasoline Price (HUF/liter, weekly average)"
+  ) +
+  theme_minimal(base_size = 12)
+
+on_highway_boxplot
+```
+
+Spatial Distribution of Fuel Stations by Border Proximity
+```{r}
+at_border_map <- ggplot() +
+  geom_sf(data = hungary, fill = "white", color = "black") +
+  geom_sf(data = stations_sf, aes(color = near_border_20km), size = 1.8, alpha = 0.8) +
+  scale_color_manual(
+    values = c("1" = "#FDB462", "0" = "grey40"),
+    labels = c("1" = "Within 20 km of border",
+               "0" = "Not near border")) +
+  theme_void() +
+  labs(
+    title = "Spatial Distribution of Fuel Stations by Border Proximity",
+    subtitle = "Shaded area indicates 20 km zone within Hungary's international borders",
+    color = "Border proximity"
+  )
+at_border_map
+```
+
+Spatial Distribution of Fuel Stations by Gasoline Price (HUF/liter, weekly average)
+```{r}
+
+price_map <- ggplot() +
+  geom_sf(data = hungary, fill = "white", color = "black") +
+  geom_sf(data = highway_sf, size = 0.5, alpha = 0.8) +
+  geom_sf(data = stations_sf, aes(color = gasoline_avg), size = 1.8, alpha = 0.8) +
+  scale_color_distiller(palette = "PuOr",direction = -1, name = "Gasoline Price") +
+  theme_void() +
+  labs(
+    title = "Spatial Distribution of Fuel Stations by Gasoline Price (HUF/liter, weekly average)",
+    subtitle = "Highway network (motorways only) shown in the background",
+    color = "Gasoline Price (HUF/liter, weekly average)"
+  )
+price_map
+```
+Density  plot and Histogram of Prices (majd válasszunk)
+```{r}
+
+density_plot_price_filled <- ggplot(data, aes(x = gasoline_avg)) +
+  geom_density(
+    fill = "#BEBADA",
+    color = "black",
+    alpha = 0.7
+  ) +
+  labs(
+    title = "Density Plot of Average Gasoline Prices",
+    x = "Average Gasoline Price (EUR/liter)",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 12)
+
+density_plot_price_filled
+
+
+histogram_price <- ggplot(data, aes(x = gasoline_avg)) +
+  geom_histogram(
+    color = "black",
+    fill= "#bebada",
+    binwidth = 0.5, 
+    alpha = 0.8
+  ) +
+  labs(
+    title = "Histogram of Average Gasoline Prices",
+    x = "Average Gasoline Price (EUR/liter)",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 12) 
+histogram_price
+
+```
+
+
+Desciptive statistics
+```{r}
+library(gtsummary)
+install.packages("kableExtra")
+library(kableExtra)
+
+tbl_summary(data[,c("gasoline_avg", "diesel_avg","brand_cat" ,"brand_in_sett", "n_competitors_other_brand", "on_highway", "dist_border_km", "near_border_10km", "near_border_20km", "hhi_brand", "area_ha", "population", "pop_density")], statistic = list(all_continuous() ~ "{mean} ({sd})", all_categorical() ~ "{n} ({p}%)"), missing="no")
+
+#chatgptnek beadni hogy latexbe formázza át
+```
+
+
+Regresszió (nem muszáj így, kicsit lehet tré de azért itt van)
+```{r}
+results_df <- data.frame(
+  term = c("brand_catdiscount", "brand_catsmall", "log(brand_in_sett + 1e-06)", 
+           "log(n_competitors_other_brand + 1e-07)", "hhi_brand", "log(pop_density)",
+           "on_highway1", "near_border_20km1", "on_highway1:near_border_20km1",
+           "brand_catdiscount", "brand_catsmall", "log(brand_in_sett + 1e-06)", 
+           "log(n_competitors_other_brand + 1e-07)", "hhi_brand", "log(pop_density)",
+           "on_highway1", "near_border_20km1", "on_highway1:near_border_20km1"),
+  estimate = c(-7.596, -4.893, 1.806, 0.256, 8.200, -0.721, 43.744, 0.843, -9.023,
+               -8.234, -7.007, 1.636, 0.161, 6.504, -0.576, 43.872, 1.337, -9.543),
+  std.error = c(0.682, 0.647, 0.522, 0.116, 2.892, 0.281, 0.947, 0.539, 2.716,
+                0.676, 0.628, 0.517, 0.115, 2.866, 0.281, 0.941, 0.533, 2.537),
+  model = c(rep("gasoline_avg", 9), rep("diesel_avg", 9))
+)
+
+results_df <- results_df %>%
+  mutate(
+    conf.low = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error
+  )
+
+term_labels <- c(
+  "brand_catdiscount" = "Brand: Discount",
+  "brand_catsmall" = "Brand: Small",
+  "log(brand_in_sett + 1e-06)" = "Log(Brand in Sett.)",
+  "log(n_competitors_other_brand + 1e-07)" = "Log(Competitors)",
+  "hhi_brand" = "Brand HHI",
+  "log(pop_density)" = "Log(Pop. Density)",
+  "on_highway1" = "On Highway",
+  "near_border_20km1" = "Near Border (20km)",
+  "on_highway1:near_border_20km1" = "On Highway × Near Border"
+)
+
+results_df <- results_df %>%
+  mutate(
+    term_clean = recode(term, !!!term_labels)
+  )
+
+ordered_terms <- c(
+  "Brand: Discount", "Brand: Small", "Log(Brand in Sett.)",
+  "Log(Competitors)", "Brand HHI", "Log(Pop. Density)",
+  "On Highway", "Near Border (20km)", "On Highway × Near Border"
+)
+
+results_df$term_clean <- factor(results_df$term_clean, levels = rev(ordered_terms))
+
+coef_plot <- ggplot(results_df, aes(x = estimate, y = term_clean, color = model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), 
+                 height = 0, 
+                 position = position_dodge(width = 0.6),
+                 linewidth = 0.8) +
+  geom_point(position = position_dodge(width = 0.6), size = 2.5) +
+  scale_color_manual(values = c("gasoline_avg" = "#FDB462", "diesel_avg" = "#AEACCA"),
+                     labels = c("Gasoline Price", "Diesel Price")) +
+  labs(
+    title = "Regression Coefficient Estimates",
+    subtitle = "Showing 95% Confidence Intervals",
+    x = "Coefficient Estimate",
+    y = NULL,
+    color = "Dependent Variable"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "bottom",
+    axis.text.y = element_text(size = 10)
+  )
+
+print(coef_plot)
+```
+Interaction barplots
+```{r}
+
+data_summary <- data %>%
+  mutate(
+    Highway_location = ifelse(on_highway == 1, "On highway", "Off highway"),
+    Border_location = ifelse(near_border_20km == 1, "Within 20km", "Farther than 20km")
+  ) %>%
+  group_by(Highway_location, Border_location) %>%
+  summarise(
+    mean_gasoline = mean(gasoline_avg, na.rm = TRUE),
+    sd_gasoline = sd(gasoline_avg, na.rm = TRUE),
+    n = n(),
+    .groups = 'drop' 
+  )
+
+interaction_bar_plot <- ggplot(data_summary, aes(x = Highway_location, y = mean_gasoline, fill = Border_location)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9), alpha = 0.8) +
+  
+  geom_errorbar(
+    aes(ymin = mean_gasoline - sd_gasoline, ymax = mean_gasoline + sd_gasoline),
+    position = position_dodge(width = 0.9),
+    width = 0.25,
+    color = "black"
+  ) +
+  
+  scale_fill_manual(values = c("Within 20km" = "#FDB462", "Farther than 20km" = "grey40")) +
+  
+  labs(
+    title = "Mean Gasoline Price by Highway and Border Location",
+    x = "Highway Location",
+    y = "Mean Gasoline Price (HUF/liter)",
+    fill = "Border Location"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom"
+  )
+
+interaction_bar_plot
+```
+
